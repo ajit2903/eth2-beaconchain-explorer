@@ -101,7 +101,6 @@ func InitBigtable(project, instance, chainId, redisAddress string) (*Bigtable, e
 	poolSize := 50
 	btClient, err := gcp_bigtable.NewClient(ctx, project, instance, option.WithGRPCConnectionPool(poolSize))
 	// btClient, err := gcp_bigtable.NewClient(context.Background(), project, instance)
-
 	if err != nil {
 		return nil, err
 	}
@@ -2743,6 +2742,21 @@ func (bigtable *Bigtable) GetTotalValidatorIncomeDetailsHistory(startEpoch uint6
 func (bigtable *Bigtable) DeleteEpoch(epoch uint64) error {
 	// TOTO: Implement
 	return fmt.Errorf("NOT IMPLEMENTED")
+}
+
+func (bigtable *Bigtable) PurgeV2Data(validatorIndex, thresholdEpoch uint64) error {
+	// create the row ranges for each column family
+	vals := []uint64{validatorIndex}
+	balanceRange := bigtable.getValidatorsEpochRanges(vals, VALIDATOR_BALANCES_FAMILY, 0, thresholdEpoch)
+	err := bigtable.ClearByRowRange("beaconchain_validators", "*", "*", balanceRange, true)
+	if err != nil {
+		return err
+	}
+	// attestationHistoryRange := bigtable.getValidatorsEpochRanges(vals, ATTESTATIONS_FAMILY, 0, thresholdEpoch)
+	// syncDutiesHistoryRange := bigtable.getValidatorSlotRanges(vals, SYNC_COMMITTEES_FAMILY, 0, thresholdEpoch*utils.Config.Chain.ClConfig.SlotsPerEpoch)
+	// incomeRange := bigtable.getValidatorsEpochRanges(vals, INCOME_DETAILS_COLUMN_FAMILY, 0, thresholdEpoch)
+
+	return nil
 }
 
 func (bigtable *Bigtable) getValidatorsEpochRanges(validatorIndices []uint64, prefix string, startEpoch uint64, endEpoch uint64) gcp_bigtable.RowRangeList {
