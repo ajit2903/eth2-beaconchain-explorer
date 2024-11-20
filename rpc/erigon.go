@@ -3,13 +3,16 @@ package rpc
 import (
 	"context"
 	"encoding/hex"
-	"eth2-exporter/contracts/oneinchoracle"
-	"eth2-exporter/erc20"
-	"eth2-exporter/types"
 	"fmt"
 	"math/big"
 	"strings"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/contracts/oneinchoracle"
+	"github.com/gobitfly/eth2-beaconchain-explorer/erc20"
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/ethereum/go-ethereum"
@@ -87,6 +90,11 @@ func (client *ErigonClient) GetRPCClient() *geth_rpc.Client {
 }
 
 func (client *ErigonClient) GetBlock(number int64, traceMode string) (*types.Eth1Block, *types.GetBlockTimings, error) {
+	startTime := time.Now()
+	defer func() {
+		metrics.TaskDuration.WithLabelValues("rpc_el_get_block").Observe(time.Since(startTime).Seconds())
+	}()
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
@@ -261,27 +269,7 @@ func (client *ErigonClient) GetBlock(number int64, traceMode string) (*types.Eth
 						Path: fmt.Sprint(trace.TraceAddress),
 					}
 
-					if tracePb.Type == "call" {
-						tracePb.Type = trace.Action.CallType
-					}
-
-					if trace.Type == "create" {
-						tracePb.From = common.FromHex(trace.Action.From)
-						tracePb.To = common.FromHex(trace.Result.Address)
-						tracePb.Value = common.FromHex(trace.Action.Value)
-					} else if trace.Type == "suicide" {
-						tracePb.From = common.FromHex(trace.Action.Address)
-						tracePb.To = common.FromHex(trace.Action.RefundAddress)
-						tracePb.Value = common.FromHex(trace.Action.Balance)
-					} else if trace.Type == "call" {
-						tracePb.From = common.FromHex(trace.Action.From)
-						tracePb.To = common.FromHex(trace.Action.To)
-						tracePb.Value = common.FromHex(trace.Action.Value)
-					} else {
-						spew.Dump(trace)
-						logrus.Fatalf("unknown trace type %v in tx %v", trace.Type, trace.TransactionHash)
-					}
-
+					tracePb.From, tracePb.To, tracePb.Value, tracePb.Type = trace.ConvertFields()
 					c.Transactions[trace.TransactionPosition].Itx = append(c.Transactions[trace.TransactionPosition].Itx, tracePb)
 				}
 			}
@@ -385,6 +373,11 @@ func (client *ErigonClient) GetBlock(number int64, traceMode string) (*types.Eth
 }
 
 func (client *ErigonClient) GetBlockNumberByHash(hash string) (uint64, error) {
+	startTime := time.Now()
+	defer func() {
+		metrics.TaskDuration.WithLabelValues("rpc_el_get_block_number_by_hash").Observe(time.Since(startTime).Seconds())
+	}()
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
@@ -396,6 +389,11 @@ func (client *ErigonClient) GetBlockNumberByHash(hash string) (uint64, error) {
 }
 
 func (client *ErigonClient) GetLatestEth1BlockNumber() (uint64, error) {
+	startTime := time.Now()
+	defer func() {
+		metrics.TaskDuration.WithLabelValues("rpc_el_get_latest_eth1_block_number").Observe(time.Since(startTime).Seconds())
+	}()
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
@@ -494,6 +492,31 @@ type ParityTraceResult struct {
 	Type                string  `json:"type"`
 }
 
+func (trace *ParityTraceResult) ConvertFields() ([]byte, []byte, []byte, string) {
+	var from, to, value []byte
+	tx_type := trace.Type
+
+	switch trace.Type {
+	case "create":
+		from = common.FromHex(trace.Action.From)
+		to = common.FromHex(trace.Result.Address)
+		value = common.FromHex(trace.Action.Value)
+	case "suicide":
+		from = common.FromHex(trace.Action.Address)
+		to = common.FromHex(trace.Action.RefundAddress)
+		value = common.FromHex(trace.Action.Balance)
+	case "call":
+		from = common.FromHex(trace.Action.From)
+		to = common.FromHex(trace.Action.To)
+		value = common.FromHex(trace.Action.Value)
+		tx_type = trace.Action.CallType
+	default:
+		spew.Dump(trace)
+		utils.LogFatal(nil, "unknown trace type", 0, map[string]interface{}{"trace type": trace.Type, "tx hash": trace.TransactionHash})
+	}
+	return from, to, value, tx_type
+}
+
 func (client *ErigonClient) TraceParity(blockNumber uint64) ([]*ParityTraceResult, error) {
 	var res []*ParityTraceResult
 
@@ -517,6 +540,11 @@ func (client *ErigonClient) TraceParityTx(txHash string) ([]*ParityTraceResult, 
 }
 
 func (client *ErigonClient) GetBalances(pairs []*types.Eth1AddressBalance, addressIndex, tokenIndex int) ([]*types.Eth1AddressBalance, error) {
+	startTime := time.Now()
+	defer func() {
+		metrics.TaskDuration.WithLabelValues("rpc_el_get_balances").Observe(time.Since(startTime).Seconds())
+	}()
+
 	batchElements := make([]geth_rpc.BatchElem, 0, len(pairs))
 
 	ret := make([]*types.Eth1AddressBalance, len(pairs))

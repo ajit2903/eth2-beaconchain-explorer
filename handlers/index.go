@@ -2,13 +2,14 @@ package handlers
 
 import (
 	"encoding/json"
-	"eth2-exporter/services"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"math"
 	"net/http"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 )
 
 // Index will return the main "index" page using a go template
@@ -96,7 +97,7 @@ func getSlotVizData(currentEpoch uint64) *types.SlotVizPageData {
 }
 
 func calculateChurn(page *types.IndexPageData) {
-	limit := services.GetLatestStats().ValidatorChurnLimit
+	limit := services.GetLatestStats().ValidatorActivationChurnLimit
 	pending_validators := services.GetLatestStats().PendingValidatorCount
 	// calculate daily new validators
 	limit_per_day := *limit * uint64(225)

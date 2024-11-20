@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"firebase.google.com/go/messaging"
+	"firebase.google.com/go/v4/messaging"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/lib/pq"
@@ -310,12 +310,14 @@ type MobileSubscriptionTransactionGeneric struct {
 }
 
 type PremiumData struct {
-	ID        uint64    `db:"id"`
-	Receipt   string    `db:"receipt"`
-	Store     string    `db:"store"`
-	Active    bool      `db:"active"`
-	ProductID string    `db:"product_id"`
-	ExpiresAt time.Time `db:"expires_at"`
+	ID               uint64    `db:"id"`
+	Receipt          string    `db:"receipt"`
+	Store            string    `db:"store"`
+	Active           bool      `db:"active"`
+	ValidateRemotely bool      `db:"validate_remotely"`
+	ProductID        string    `db:"product_id"`
+	UserID           uint64    `db:"user_id"`
+	ExpiresAt        time.Time `db:"expires_at"`
 }
 
 type UserWithPremium struct {
@@ -612,4 +614,9 @@ type SearchValidatorsByEth1Result []struct {
 	Eth1Address      string        `db:"from_address_text" json:"eth1_address"`
 	ValidatorIndices pq.Int64Array `db:"validatorindices" json:"validator_indices"`
 	Count            uint64        `db:"count" json:"-"`
+}
+
+type ValidatorStateCountRow struct {
+	Name  string `db:"status"`
+	Count uint64 `db:"validator_count"`
 }

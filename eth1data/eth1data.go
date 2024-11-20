@@ -5,16 +5,17 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
-	"eth2-exporter/cache"
-	"eth2-exporter/db"
-	"eth2-exporter/rpc"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"math/big"
 	"strings"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/cache"
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -27,7 +28,7 @@ import (
 var logger = logrus.New().WithField("module", "eth1data")
 var ErrTxIsPending = errors.New("error retrieving data for tx: tx is still pending")
 
-func GetEth1Transaction(hash common.Hash) (*types.Eth1TxData, error) {
+func GetEth1Transaction(hash common.Hash, currency string) (*types.Eth1TxData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
@@ -134,25 +135,24 @@ func GetEth1Transaction(hash common.Hash) (*types.Eth1TxData, error) {
 		}
 	}
 
+	data, err := rpc.CurrentErigonClient.TraceParityTx(tx.Hash().Hex())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get parity trace for revert reason: %w", err)
+	}
 	if receipt.Status != 1 {
-		data, err := rpc.CurrentErigonClient.TraceParityTx(tx.Hash().Hex())
-		if err != nil {
-			return nil, fmt.Errorf("failed to get parity trace for revert reason: %w", err)
-		}
 		errorMsg, err := abi.UnpackRevert(utils.MustParseHex(data[0].Result.Output))
 		if err == nil {
 			txPageData.ErrorMsg = errorMsg
 		}
-	}
-	if receipt.Status == 1 {
+	} else {
 		txPageData.Transfers, err = db.BigtableClient.GetArbitraryTokenTransfersForTransaction(tx.Hash().Bytes())
 		if err != nil {
 			return nil, fmt.Errorf("error loading token transfers from tx: %w", err)
 		}
-		txPageData.InternalTxns, err = db.BigtableClient.GetInternalTransfersForTransaction(tx.Hash().Bytes(), msg.From.Bytes())
-		if err != nil {
-			return nil, fmt.Errorf("error loading internal transfers from tx: %w", err)
-		}
+	}
+	txPageData.InternalTxns, err = db.BigtableClient.GetInternalTransfersForTransaction(tx.Hash().Bytes(), msg.From.Bytes(), data, currency)
+	if err != nil {
+		return nil, fmt.Errorf("error loading internal transfers from tx: %w", err)
 	}
 	txPageData.FromName, err = db.BigtableClient.GetAddressName(msg.From.Bytes())
 	if err != nil {

@@ -2,17 +2,18 @@ package handlers
 
 import (
 	"database/sql"
-	"eth2-exporter/db"
-	"eth2-exporter/rpc"
-	"eth2-exporter/services"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/gorilla/mux"
@@ -152,7 +153,13 @@ func GetExecutionBlockPageData(number uint64, limit int) (*types.Eth1BlockPageDa
 	lowestGasPrice := big.NewInt(1 << 62)
 	blobTxCount := 0
 	blobCount := 0
-	for _, tx := range block.Transactions {
+
+	contractInteractionTypes, err := db.BigtableClient.GetAddressContractInteractionsAtBlock(block)
+	if err != nil {
+		utils.LogError(err, "error getting contract states", 0)
+	}
+
+	for i, tx := range block.Transactions {
 		if tx.Type == 3 {
 			blobTxCount++
 			blobCount += len(tx.BlobVersionedHashes)
@@ -171,20 +178,15 @@ func GetExecutionBlockPageData(number uint64, limit int) (*types.Eth1BlockPageDa
 			}
 		}
 
+		contractCreation := tx.GetTo() == nil
 		// set tx to if tx is contract creation
-		if tx.To == nil && len(tx.Itx) >= 1 {
-			tx.To = tx.Itx[0].To
-			names[string(tx.To)] = "Contract Creation"
+		if contractCreation {
+			tx.To = tx.ContractAddress
 		}
 
-		method := "Transfer"
-		{
-			d := tx.GetData()
-			if len(d) > 3 {
-				m := d[:4]
-				invokesContract := len(tx.GetItx()) > 0 || tx.GetGasUsed() > 21000 || tx.GetErrorMsg() != ""
-				method = db.BigtableClient.GetMethodLabel(m, invokesContract)
-			}
+		var contractInteraction types.ContractInteractionType
+		if len(contractInteractionTypes) > i {
+			contractInteraction = contractInteractionTypes[i]
 		}
 
 		txs = append(txs, types.Eth1BlockPageTransaction{
@@ -193,11 +195,11 @@ func GetExecutionBlockPageData(number uint64, limit int) (*types.Eth1BlockPageDa
 			From:          fmt.Sprintf("%#x", tx.From),
 			FromFormatted: utils.FormatAddressWithLimits(tx.From, names[string(tx.From)], false, "address", 15, 20, true),
 			To:            fmt.Sprintf("%#x", tx.To),
-			ToFormatted:   utils.FormatAddressWithLimits(tx.To, names[string(tx.To)], names[string(tx.To)] == "Contract Creation" || len(method) > 0, "address", 15, 20, true),
+			ToFormatted:   utils.FormatAddressWithLimits(tx.To, db.BigtableClient.GetAddressLabel(names[string(tx.To)], contractInteraction), contractInteraction != types.CONTRACT_NONE, "address", 15, 20, true),
 			Value:         new(big.Int).SetBytes(tx.Value),
 			Fee:           txFee,
 			GasPrice:      effectiveGasPrice,
-			Method:        method,
+			Method:        db.BigtableClient.GetMethodLabel(tx.GetData(), contractInteraction),
 		})
 	}
 

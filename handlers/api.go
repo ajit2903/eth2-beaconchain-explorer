@@ -8,12 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"eth2-exporter/db"
-	"eth2-exporter/exporter"
-	"eth2-exporter/price"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"io"
 	"math/big"
@@ -24,6 +18,13 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/exporter"
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/ethereum/go-ethereum/common"
 	gorillacontext "github.com/gorilla/context"
@@ -257,6 +258,34 @@ func ApiEthStoreDay(w http.ResponseWriter, r *http.Request) {
 	returnQueryResults(rows, w, r, addDayTime)
 }
 
+// ApiLatestState godoc
+// @Summary Get the latest state of the network
+// @Tags Network
+// @Description Returns information on the current state of the network
+// @Produce  json
+// @Failure 400 {object} types.ApiResponse "Failure"
+// @Failure 500 {object} types.ApiResponse "Server Error"
+// @Router /api/v1/latestState [get]
+func ApiLatestState(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", utils.Config.Chain.ClConfig.SecondsPerSlot)) // set local cache to the seconds per slot interval
+
+	data := services.LatestState()
+	data.Rates = services.GetRates(GetCurrency(r))
+	userAgent := r.Header.Get("User-Agent")
+	userAgent = strings.ToLower(userAgent)
+	if strings.Contains(userAgent, "android") || strings.Contains(userAgent, "iphone") || strings.Contains(userAgent, "windows phone") {
+		data.Rates.MainCurrencyPriceFormatted = utils.KFormatterEthPrice(uint64(data.Rates.MainCurrencyPrice))
+	}
+
+	err := json.NewEncoder(w).Encode(data)
+	if err != nil {
+		logger.Errorf("error sending latest index page data: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+}
+
 // ApiEpoch godoc
 // @Summary Get epoch by number, latest, finalized
 // @Tags Epoch
@@ -297,7 +326,7 @@ func ApiEpoch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := db.ReaderDb.Query(`SELECT attestationscount, attesterslashingscount, averagevalidatorbalance, blockscount, depositscount, eligibleether, epoch, (epoch <= $2) AS finalized, globalparticipationrate, proposerslashingscount, rewards_exported, totalvalidatorbalance, validatorscount, voluntaryexitscount, votedether, withdrawalcount, 
+	rows, err := db.ReaderDb.Query(`SELECT attestationscount, attesterslashingscount, averagevalidatorbalance, blockscount, depositscount, eligibleether, epoch, (epoch <= $2) AS finalized, globalparticipationrate, proposerslashingscount, rewards_exported, totalvalidatorbalance, validatorscount, voluntaryexitscount, votedether, COALESCE(withdrawalcount,0) as withdrawalcount, 
 		(SELECT COUNT(*) FROM blocks WHERE epoch = $1 AND status = '0') as scheduledblocks,
 		(SELECT COUNT(*) FROM blocks WHERE epoch = $1 AND status = '1') as proposedblocks,
 		(SELECT COUNT(*) FROM blocks WHERE epoch = $1 AND status = '2') as missedblocks,
@@ -355,7 +384,7 @@ func ApiEpochSlots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := db.ReaderDb.Query("SELECT attestationscount, attesterslashingscount, blockroot, depositscount, epoch, eth1data_blockhash, eth1data_depositcount, eth1data_depositroot, exec_base_fee_per_gas, exec_block_hash, exec_block_number, exec_extra_data, exec_fee_recipient, exec_gas_limit, exec_gas_used, exec_logs_bloom, exec_parent_hash, exec_random, exec_receipts_root, exec_state_root, exec_timestamp, exec_transactions_count, graffiti, graffiti_text, parentroot, proposer, proposerslashingscount, randaoreveal, signature, slot, stateroot, status, syncaggregate_bits, syncaggregate_participation, syncaggregate_signature, voluntaryexitscount, withdrawalcount FROM blocks WHERE epoch = $1 ORDER BY slot", epoch)
+	rows, err := db.ReaderDb.Query("SELECT attestationscount, attesterslashingscount, blockroot, depositscount, epoch, eth1data_blockhash, eth1data_depositcount, eth1data_depositroot, exec_base_fee_per_gas, exec_block_hash, exec_block_number, exec_extra_data, exec_fee_recipient, exec_gas_limit, exec_gas_used, exec_logs_bloom, exec_parent_hash, exec_random, exec_receipts_root, exec_state_root, exec_timestamp, COALESCE(exec_transactions_count,0) as exec_transactions_count, graffiti, graffiti_text, parentroot, proposer, proposerslashingscount, randaoreveal, signature, slot, stateroot, status, syncaggregate_bits, syncaggregate_participation, syncaggregate_signature, voluntaryexitscount, COALESCE(withdrawalcount,0) as withdrawalcount FROM blocks WHERE epoch = $1 ORDER BY slot", epoch)
 	if err != nil {
 		sendServerErrorResponse(w, r.URL.String(), "could not retrieve db results")
 		return
@@ -434,7 +463,7 @@ func ApiSlots(w http.ResponseWriter, r *http.Request) {
 		blocks.attesterslashingscount,
 		blocks.attestationscount,
 		blocks.depositscount,
-		blocks.withdrawalcount, 
+		COALESCE(withdrawalcount,0) as withdrawalcount, 
 		blocks.voluntaryexitscount,
 		blocks.proposer,
 		blocks.status,
@@ -1198,7 +1227,13 @@ func getSyncCommitteeSlotsStatistics(validators []uint64, epoch uint64) (types.S
 		lastExportedEpoch = ((lastExportedDay + 1) * epochsPerDay) - 1
 	}
 
-	err = db.ReaderDb.Get(&syncStats, `SELECT SUM(COALESCE(participated_sync_total, 0)) AS participated, SUM(COALESCE(missed_sync_total, 0)) AS missed FROM validator_stats WHERE day = $1 AND validatorindex = ANY($2)`, lastExportedDay, pq.Array(validators))
+	err = db.ReaderDb.Get(&syncStats, `
+		SELECT 
+		COALESCE(SUM(COALESCE(participated_sync_total, 0)), 0) AS participated, 
+		COALESCE(SUM(COALESCE(missed_sync_total, 0)),0) AS missed 
+		FROM validator_stats 
+		WHERE day = $1 AND validatorindex = ANY($2)
+		`, lastExportedDay, pq.Array(validators))
 	if err != nil {
 		return types.SyncCommitteesStats{}, err
 	}
@@ -2097,7 +2132,7 @@ func ApiValidatorBlsChange(w http.ResponseWriter, r *http.Request) {
 			Address:                  fmt.Sprintf("0x%x", d.Address),
 			Signature:                fmt.Sprintf("0x%x", d.Signature),
 			WithdrawalCredentialsOld: fmt.Sprintf("0x%x", d.WithdrawalCredentialsOld),
-			WithdrawalCredentialsNew: fmt.Sprintf("0x010000000000000000000000%x", d.Address),
+			WithdrawalCredentialsNew: fmt.Sprintf("0x"+utils.BeginningOfSetWithdrawalCredentials+"%x", d.Address),
 		})
 	}
 
@@ -2915,6 +2950,9 @@ func getTokenByCode(w http.ResponseWriter, r *http.Request) {
 		pkg.Package = "standard"
 	}
 
+	// BIDS-3049 mobile app uses v1 package ids only
+	pkg.Package = utils.MapProductV2ToV1(pkg.Package)
+
 	var theme string = ""
 	if pkg.Store == "ethpool" {
 		theme = "ethpool"
@@ -2968,6 +3006,9 @@ func getTokenByRefresh(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		pkg.Package = "standard"
 	}
+
+	// BIDS-3049 mobile app uses v1 package ids only
+	pkg.Package = utils.MapProductV2ToV1(pkg.Package)
 
 	var theme string = ""
 	if pkg.Store == "ethpool" {
@@ -3093,7 +3134,6 @@ func hmacSign(data string) string {
 }
 
 func RegisterMobileSubscriptions(w http.ResponseWriter, r *http.Request) {
-
 	w.Header().Set("Content-Type", "application/json")
 
 	var parsedBase types.MobileSubscription
@@ -3102,6 +3142,17 @@ func RegisterMobileSubscriptions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		logger.Errorf("error parsing body | err: %v", err)
 		SendBadRequestResponse(w, r.URL.String(), "could not parse body")
+		return
+	}
+
+	if parsedBase.ProductID == "plankton" {
+		SendBadRequestResponse(w, r.URL.String(), "old product")
+		return
+	}
+
+	// Only allow ios and android purchases to be registered via this endpoint
+	if parsedBase.Transaction.Type != "ios-appstore" && parsedBase.Transaction.Type != "android-playstore" {
+		SendBadRequestResponse(w, r.URL.String(), "invalid transaction type")
 		return
 	}
 
@@ -3130,10 +3181,14 @@ func RegisterMobileSubscriptions(w http.ResponseWriter, r *http.Request) {
 
 	// we can ignore this error since it always returns a result object and err
 	// case is not needed on receipt insert
-	validationResult, _ := exporter.VerifyReceipt(nil, verifyPackage)
+	validationResult, err := exporter.VerifyReceipt(nil, nil, verifyPackage)
+	if err != nil {
+		utils.LogError(err, "could not verify receipt %v", 0, map[string]interface{}{"receipt": verifyPackage.Receipt})
+	}
 	parsedBase.Valid = validationResult.Valid
+	parsedBase.ProductID = verifyPackage.ProductID // apple verify can change the product id
 
-	err = db.InsertMobileSubscription(nil, claims.UserID, parsedBase, parsedBase.Transaction.Type, parsedBase.Transaction.Receipt, validationResult.ExpirationDate, validationResult.RejectReason, "")
+	err = db.InsertMobileSubscription(nil, claims.UserID, parsedBase, parsedBase.Transaction.Type, verifyPackage.Receipt, validationResult.ExpirationDate, validationResult.RejectReason, "")
 	if err != nil {
 		logger.Errorf("could not save subscription data %v", err)
 		SendBadRequestResponse(w, r.URL.String(), "Can not save subscription data")
@@ -3187,6 +3242,8 @@ func GetUserPremiumByPackage(pkg string) PremiumUser {
 		NotificationThresholds: false,
 		NoAds:                  false,
 	}
+
+	pkg = utils.MapProductV2ToV1(pkg)
 
 	if pkg == "" || pkg == "standard" {
 		return result

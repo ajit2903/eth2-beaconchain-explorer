@@ -4,16 +4,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"eth2-exporter/db"
-	"eth2-exporter/eth1data"
-	"eth2-exporter/services"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"html/template"
 	"net/http"
 	"strings"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/eth1data"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -50,7 +51,7 @@ func Eth1TransactionTx(w http.ResponseWriter, r *http.Request) {
 		data = InitPageData(w, r, "blockchain", path, title, txNotFoundTemplateFiles)
 		txTemplate = txNotFoundTemplate
 	} else {
-		txData, err := eth1data.GetEth1Transaction(common.BytesToHash(txHash))
+		txData, err := eth1data.GetEth1Transaction(common.BytesToHash(txHash), "ETH")
 		if err != nil {
 			mempool := services.LatestMempoolTransactions()
 			mempoolTx := mempool.FindTxByHash(txHashString)
@@ -122,5 +123,46 @@ func Eth1TransactionTx(w http.ResponseWriter, r *http.Request) {
 
 	if handleTemplateError(w, r, "eth1tx.go", "Eth1TransactionTx", "Done", err) != nil {
 		return // an error has occurred and was processed
+	}
+}
+
+func Eth1TransactionTxData(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	vars := mux.Vars(r)
+	txHashString := vars["hash"]
+	currency := GetCurrency(r)
+	err := json.NewEncoder(w).Encode(getEth1TransactionTxData(txHashString, currency))
+	if err != nil {
+		logger.Errorf("error enconding json response for %v route: %v", r.URL.String(), err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
+}
+
+func getEth1TransactionTxData(txhash, currency string) *types.DataTableResponse {
+	tableData := make([][]interface{}, 0, minimumTransactionsPerUpdate)
+	txHash, err := hex.DecodeString(strings.ReplaceAll(txhash, "0x", ""))
+	if err != nil {
+		logger.Warnf("error parsing tx hash %v: %v", txhash, err)
+	} else {
+		txData, err := eth1data.GetEth1Transaction(common.BytesToHash(txHash), currency)
+		its := txData.InternalTxns
+		if err != nil {
+			utils.LogError(err, "error getting transaction data", 0, map[string]interface{}{"txhash": txHash})
+		} else {
+			for _, i := range its {
+				tableData = append(tableData, []interface{}{
+					i.TracePath,
+					i.From,
+					i.To,
+					i.Amount,
+					i.Gas.Limit,
+				})
+			}
+		}
+	}
+
+	return &types.DataTableResponse{
+		Data: tableData,
 	}
 }

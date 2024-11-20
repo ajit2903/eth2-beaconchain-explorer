@@ -4,19 +4,7 @@ import (
 	"context"
 	"encoding/gob"
 	"encoding/hex"
-	"eth2-exporter/cache"
-	"eth2-exporter/db"
-	ethclients "eth2-exporter/ethClients"
-	"eth2-exporter/exporter"
-	"eth2-exporter/handlers"
-	"eth2-exporter/metrics"
-	"eth2-exporter/price"
-	"eth2-exporter/rpc"
-	"eth2-exporter/services"
-	"eth2-exporter/static"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"eth2-exporter/version"
+	"errors"
 	"flag"
 	"fmt"
 	"math/big"
@@ -25,12 +13,28 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gobitfly/eth2-beaconchain-explorer/cache"
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	ethclients "github.com/gobitfly/eth2-beaconchain-explorer/ethClients"
+	"github.com/gobitfly/eth2-beaconchain-explorer/exporter"
+	"github.com/gobitfly/eth2-beaconchain-explorer/handlers"
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/ratelimit"
+	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/static"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+	"github.com/gobitfly/eth2-beaconchain-explorer/version"
+
 	httpSwagger "github.com/swaggo/http-swagger"
 
 	"github.com/sirupsen/logrus"
 
-	_ "eth2-exporter/docs"
 	_ "net/http/pprof"
+
+	_ "github.com/gobitfly/eth2-beaconchain-explorer/docs"
 
 	"github.com/gorilla/csrf"
 	"github.com/gorilla/mux"
@@ -46,14 +50,16 @@ func initStripe(http *mux.Router) error {
 		return fmt.Errorf("error no config found")
 	}
 	stripe.Key = utils.Config.Frontend.Stripe.SecretKey
-	http.HandleFunc("/stripe/create-checkout-session", handlers.StripeCreateCheckoutSession).Methods("POST")
-	http.HandleFunc("/stripe/customer-portal", handlers.StripeCustomerPortal).Methods("POST")
+	http.HandleFunc("/stripe/create-checkout-session", handlers.StripeCreateCheckoutSession).Methods("POST", "OPTIONS")
+	http.HandleFunc("/stripe/customer-portal", handlers.StripeCustomerPortal).Methods("POST", "OPTIONS")
 	return nil
 }
 
 func init() {
 	gob.Register(types.DataTableSaveState{})
 }
+
+var frontendHttpServer *http.Server
 
 func main() {
 	configPath := flag.String("config", "", "Path to the config file, if empty string defaults will be used")
@@ -101,6 +107,7 @@ func main() {
 			Port:         cfg.WriterDatabase.Port,
 			MaxOpenConns: cfg.WriterDatabase.MaxOpenConns,
 			MaxIdleConns: cfg.WriterDatabase.MaxIdleConns,
+			SSL:          cfg.WriterDatabase.SSL,
 		}, &types.DatabaseConfig{
 			Username:     cfg.ReaderDatabase.Username,
 			Password:     cfg.ReaderDatabase.Password,
@@ -109,7 +116,8 @@ func main() {
 			Port:         cfg.ReaderDatabase.Port,
 			MaxOpenConns: cfg.ReaderDatabase.MaxOpenConns,
 			MaxIdleConns: cfg.ReaderDatabase.MaxIdleConns,
-		})
+			SSL:          cfg.ReaderDatabase.SSL,
+		}, "pgx", "postgres")
 	}()
 
 	wg.Add(1)
@@ -123,6 +131,7 @@ func main() {
 			Port:         cfg.Frontend.WriterDatabase.Port,
 			MaxOpenConns: cfg.Frontend.WriterDatabase.MaxOpenConns,
 			MaxIdleConns: cfg.Frontend.WriterDatabase.MaxIdleConns,
+			SSL:          cfg.Frontend.WriterDatabase.SSL,
 		}, &types.DatabaseConfig{
 			Username:     cfg.Frontend.ReaderDatabase.Username,
 			Password:     cfg.Frontend.ReaderDatabase.Password,
@@ -131,7 +140,8 @@ func main() {
 			Port:         cfg.Frontend.ReaderDatabase.Port,
 			MaxOpenConns: cfg.Frontend.ReaderDatabase.MaxOpenConns,
 			MaxIdleConns: cfg.Frontend.ReaderDatabase.MaxIdleConns,
-		})
+			SSL:          cfg.Frontend.ReaderDatabase.SSL,
+		}, "pgx", "postgres")
 	}()
 
 	wg.Add(1)
@@ -249,6 +259,7 @@ func main() {
 
 		apiV1Router := router.PathPrefix("/api/v1").Subrouter()
 		router.PathPrefix("/api/v1/docs/").Handler(httpSwagger.WrapHandler)
+		apiV1Router.HandleFunc("/latestState", handlers.ApiLatestState).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/epoch/{epoch}", handlers.ApiEpoch).Methods("GET", "OPTIONS")
 
 		apiV1Router.HandleFunc("/epoch/{epoch}/blocks", handlers.ApiEpochSlots).Methods("GET", "OPTIONS")
@@ -370,11 +381,14 @@ func main() {
 			if err != nil {
 				logrus.WithError(err).Error("error decoding csrf auth key falling back to empty csrf key")
 			}
+
 			csrfHandler := csrf.Protect(
 				csrfBytes,
 				csrf.FieldName("CsrfField"),
 				csrf.Secure(!cfg.Frontend.CsrfInsecure),
 				csrf.Path("/"),
+				// csrf.Domain(cfg.Frontend.SessionCookieDomain),
+				csrf.SameSite(csrf.SameSiteNoneMode),
 			)
 
 			router.HandleFunc("/", handlers.Index).Methods("GET")
@@ -410,6 +424,7 @@ func main() {
 			router.HandleFunc("/block/{block}", handlers.Eth1Block).Methods("GET")
 			router.HandleFunc("/block/{block}/transactions", handlers.BlockTransactionsData).Methods("GET")
 			router.HandleFunc("/tx/{hash}", handlers.Eth1TransactionTx).Methods("GET")
+			router.HandleFunc("/tx/{hash}/data", handlers.Eth1TransactionTxData).Methods("GET")
 			router.HandleFunc("/mempool", handlers.MempoolView).Methods("GET")
 			router.HandleFunc("/burn", handlers.Burn).Methods("GET")
 			router.HandleFunc("/burn/data", handlers.BurnPageData).Methods("GET")
@@ -584,6 +599,7 @@ func main() {
 
 			authRouter.Use(handlers.UserAuthMiddleware)
 			authRouter.Use(csrfHandler)
+			authRouter.Use(utils.CORSMiddleware)
 
 			if utils.Config.Frontend.Debug {
 				// serve files from local directory when debugging, instead of from go embed file
@@ -605,6 +621,9 @@ func main() {
 			router.Use(metrics.HttpMiddleware)
 		}
 
+		ratelimit.Init()
+		router.Use(ratelimit.HttpMiddleware)
+
 		n := negroni.New(negroni.NewRecovery())
 		n.Use(gzip.Gzip(gzip.DefaultCompression))
 
@@ -623,7 +642,7 @@ func main() {
 		if utils.Config.Frontend.HttpIdleTimeout == 0 {
 			utils.Config.Frontend.HttpIdleTimeout = time.Minute
 		}
-		srv := &http.Server{
+		frontendHttpServer = &http.Server{
 			Addr:         cfg.Frontend.Server.Host + ":" + cfg.Frontend.Server.Port,
 			WriteTimeout: utils.Config.Frontend.HttpWriteTimeout,
 			ReadTimeout:  utils.Config.Frontend.HttpReadTimeout,
@@ -631,9 +650,9 @@ func main() {
 			Handler:      n,
 		}
 
-		logrus.Printf("http server listening on %v", srv.Addr)
+		logrus.Printf("http server listening on %v", frontendHttpServer.Addr)
 		go func() {
-			if err := srv.ListenAndServe(); err != nil {
+			if err := frontendHttpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logrus.WithError(err).Fatal("Error serving frontend")
 			}
 		}()
@@ -653,6 +672,15 @@ func main() {
 	}
 
 	utils.WaitForCtrlC()
+
+	if frontendHttpServer != nil {
+		logrus.Infof("shutting down frontendHttpServer")
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		defer cancel()
+		if err := frontendHttpServer.Shutdown(ctx); err != nil {
+			logrus.WithError(err).Error("error shutting down frontend server")
+		}
+	}
 
 	logrus.Println("exiting...")
 }

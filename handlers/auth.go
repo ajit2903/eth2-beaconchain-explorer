@@ -3,14 +3,15 @@ package handlers
 import (
 	"database/sql"
 	"errors"
-	"eth2-exporter/db"
-	"eth2-exporter/mail"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/mail"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"net/http"
 
@@ -167,6 +168,20 @@ func Login(w http.ResponseWriter, r *http.Request) {
 		RecaptchaKey: utils.Config.Frontend.RecaptchaSiteKey,
 	}
 
+	if redirect := q.Get("redirect"); redirect != "" {
+		http.SetCookie(w, &http.Cookie{
+			Name:   "redirect-after",
+			Value:  redirect,
+			MaxAge: 300,
+		})
+	} else if redirect := q.Get("redirect_uri"); redirect != "" {
+		http.SetCookie(w, &http.Cookie{
+			Name:   "redirect-after",
+			Value:  redirect + "&state=" + q.Get("state"),
+			MaxAge: 300,
+		})
+	}
+
 	redirectData := struct {
 		Redirect_uri string
 		State        string
@@ -247,12 +262,18 @@ func LoginPost(w http.ResponseWriter, r *http.Request) {
 			latest_and_greatest_sub AS (
 				SELECT user_id, product_id, active, created_at FROM users_app_subscriptions 
 				left join users on users.id = user_id 
-				WHERE users.email = $1 AND active = true
+				WHERE users.email = $1 AND active = true AND product_id IN ('orca.yearly', 'orca', 'dolphin.yearly', 'dolphin', 'guppy.yearly', 'guppy', 'whale', 'goldfish', 'plankton')
 				ORDER BY CASE product_id
-					WHEN 'whale' THEN 1
-					WHEN 'goldfish' THEN 2
-					WHEN 'plankton' THEN 3
-					ELSE 4  -- For any other product_id values
+					WHEN 'orca.yearly'    THEN  1
+					WHEN 'orca'           THEN  2
+					WHEN 'dolphin.yearly' THEN  3
+					WHEN 'dolphin'        THEN  4
+					WHEN 'guppy.yearly'   THEN  5
+					WHEN 'guppy'          THEN  6
+					WHEN 'whale'          THEN  7
+					WHEN 'goldfish'       THEN  8
+					WHEN 'plankton'       THEN  9
+					ELSE                       10  -- For any other product_id values
 				END, users_app_subscriptions.created_at DESC LIMIT 1
 			)
 		SELECT users.id, email, password, email_confirmed, COALESCE(product_id, '') as product_id, COALESCE(active, false) as active, COALESCE(user_group, '') AS user_group 
@@ -329,6 +350,12 @@ func LoginPost(w http.ResponseWriter, r *http.Request) {
 
 	if redirectParam != "" {
 		http.Redirect(w, r, "/user/authorize"+redirectParam, http.StatusSeeOther)
+		return
+	}
+
+	cookie, err := r.Cookie("redirect-after")
+	if err == nil && cookie.Value != "" {
+		http.Redirect(w, r, cookie.Value, http.StatusSeeOther)
 		return
 	}
 
@@ -553,12 +580,18 @@ func RequestResetPasswordPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var rateLimitError *types.RateLimitError
+	var passwordResetNotAllowedError *types.PasswordResetNotAllowedError
 	err = sendPasswordResetEmail(email)
-	if err != nil && !errors.As(err, &rateLimitError) {
-		logger.Errorf("error sending reset-email: %v", err)
-		utils.SetFlash(w, r, authSessionName, authInternalServerErrorFlashMsg)
-	} else if err != nil && errors.As(err, &rateLimitError) {
-		utils.SetFlash(w, r, authSessionName, fmt.Sprintf("Error: The ratelimit for sending emails has been exceeded, please try again in %v.", err.(*types.RateLimitError).TimeLeft.Round(time.Second)))
+	if err != nil {
+		switch {
+		case errors.As(err, &passwordResetNotAllowedError):
+			utils.SetFlash(w, r, authSessionName, "Error: Password reset is not allowed for this user.")
+		case errors.As(err, &rateLimitError):
+			utils.SetFlash(w, r, authSessionName, fmt.Sprintf("Error: The ratelimit for sending emails has been exceeded, please try again in %v.", err.(*types.RateLimitError).TimeLeft.Round(time.Second)))
+		default:
+			logger.Errorf("error sending reset-email: %v", err)
+			utils.SetFlash(w, r, authSessionName, authInternalServerErrorFlashMsg)
+		}
 	} else {
 		utils.SetFlash(w, r, authSessionName, "An email has been sent which contains a link to reset your password.")
 	}
@@ -735,6 +768,15 @@ func sendPasswordResetEmail(email string) error {
 		return err
 	}
 	defer tx.Rollback()
+
+	var passwordResetNotAllowed bool
+	err = tx.Get(&passwordResetNotAllowed, "SELECT COALESCE(password_reset_not_allowed, true) FROM users WHERE email = $1", email)
+	if err != nil {
+		return fmt.Errorf("error getting password_reset_not_allowed: %w", err)
+	}
+	if passwordResetNotAllowed {
+		return &types.PasswordResetNotAllowedError{}
+	}
 
 	var lastTs *time.Time
 	err = tx.Get(&lastTs, "SELECT password_reset_ts FROM users WHERE email = $1", email)

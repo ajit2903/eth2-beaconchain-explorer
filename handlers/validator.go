@@ -5,11 +5,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/services"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"html/template"
 	"math"
@@ -18,6 +13,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -99,9 +100,19 @@ func Validator(w http.ResponseWriter, r *http.Request) {
 
 	if *churnRate == 0 {
 		*churnRate = 4
-		logger.Warning("Churn rate not set in config using 4 as default please set minPerEpochChurnLimit")
+		logger.Warning("Churn rate not set in config using 4 as default")
 	}
 	validatorPageData.ChurnRate = *churnRate
+
+	activationChurnRate := stats.ValidatorActivationChurnLimit
+	if activationChurnRate == nil {
+		activationChurnRate = new(uint64)
+	}
+
+	if *activationChurnRate == 0 {
+		*activationChurnRate = 4
+		logger.Warning("Activation Churn rate not set in config using 4 as default")
+	}
 
 	pendingCount := stats.PendingValidatorCount
 	if pendingCount == nil {
@@ -558,7 +569,7 @@ func Validator(w http.ResponseWriter, r *http.Request) {
 				return fmt.Errorf("failed to retrieve queue ahead of validator %v: %w", validatorPageData.ValidatorIndex, err)
 			}
 			validatorPageData.QueuePosition = queueAhead + 1
-			epochsToWait := queueAhead / *churnRate
+			epochsToWait := queueAhead / *activationChurnRate
 			// calculate dequeue epoch
 			estimatedActivationEpoch := validatorPageData.Epoch + epochsToWait + 1
 			// add activation offset
@@ -729,7 +740,7 @@ func Validator(w http.ResponseWriter, r *http.Request) {
 						COALESCE(orphaned_sync_total, 0) AS orphaned_sync
 					FROM validator_stats
 					WHERE validatorindex = $1 AND day = $2`, index, lastStatsDay)
-				if err != nil {
+				if err != nil && err != sql.ErrNoRows {
 					return fmt.Errorf("error getting validator syncStats: %w", err)
 				}
 			}
@@ -1051,7 +1062,7 @@ func ValidatorProposedBlocks(w http.ResponseWriter, r *http.Request) {
 			parentroot, 
 			attestationscount, 
 			depositscount,
-			withdrawalcount, 
+			COALESCE(withdrawalcount,0) as withdrawalcount, 
 			voluntaryexitscount, 
 			proposerslashingscount, 
 			attesterslashingscount, 

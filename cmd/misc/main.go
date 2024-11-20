@@ -3,16 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
-	"eth2-exporter/cmd/misc/commands"
-	"eth2-exporter/db"
-	"eth2-exporter/exporter"
-	"eth2-exporter/rpc"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"eth2-exporter/version"
 	"fmt"
 	"math"
 	"math/big"
@@ -21,6 +15,17 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"firebase.google.com/go/v4/messaging"
+	"github.com/gobitfly/eth2-beaconchain-explorer/cmd/misc/commands"
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/exporter"
+	"github.com/gobitfly/eth2-beaconchain-explorer/notify"
+	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+	"github.com/gobitfly/eth2-beaconchain-explorer/version"
 
 	"github.com/coocood/freecache"
 	"github.com/ethereum/go-ethereum/common"
@@ -31,6 +36,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"flag"
+
+	"github.com/Gurpartap/storekit-go"
 
 	"github.com/sirupsen/logrus"
 )
@@ -55,14 +62,22 @@ var opts = struct {
 	Family              string
 	Key                 string
 	ValidatorNameRanges string
+	Email               string
+	Name                string
 	DryRun              bool
+	Yes                 bool
 }{}
+
+var bt *db.Bigtable
+var erigonClient *rpc.ErigonClient
+var lighthouseClient *rpc.LighthouseClient
+var rpcClient *rpc.LighthouseClient
 
 func main() {
 	statsPartitionCommand := commands.StatsMigratorCommand{}
 
 	configPath := flag.String("config", "config/default.config.yml", "Path to the config file")
-	flag.StringVar(&opts.Command, "command", "", "command to run, available: updateAPIKey, applyDbSchema, initBigtableSchema, epoch-export, debug-rewards, debug-blocks, clear-bigtable, index-old-eth1-blocks, update-aggregation-bits, historic-prices-export, index-missing-blocks, export-epoch-missed-slots, migrate-last-attestation-slot-bigtable, export-genesis-validators, update-block-finalization-sequentially, nameValidatorsByRanges, export-stats-totals, export-sync-committee-periods, export-sync-committee-validator-stats, partition-validator-stats")
+	flag.StringVar(&opts.Command, "command", "", "command to run, available: updateAPIKey, applyDbSchema, initBigtableSchema, epoch-export, debug-rewards, debug-blocks, clear-bigtable, index-old-eth1-blocks, update-aggregation-bits, historic-prices-export, index-missing-blocks, export-epoch-missed-slots, migrate-last-attestation-slot-bigtable, export-genesis-validators, update-block-finalization-sequentially, nameValidatorsByRanges, export-stats-totals, export-sync-committee-periods, export-sync-committee-validator-stats, partition-validator-stats, migrate-app-purchases, disable-user-per-email, validate-firebase-tokens")
 	flag.Uint64Var(&opts.StartEpoch, "start-epoch", 0, "start epoch")
 	flag.Uint64Var(&opts.EndEpoch, "end-epoch", 0, "end epoch")
 	flag.Uint64Var(&opts.User, "user", 0, "user id")
@@ -81,6 +96,9 @@ func main() {
 	flag.StringVar(&opts.ValidatorNameRanges, "validator-name-ranges", "https://config.dencun-devnet-8.ethpandaops.io/api/v1/nodes/validator-ranges", "url to or json of validator-ranges (format must be: {'ranges':{'X-Y':'name'}})")
 	flag.StringVar(&opts.Addresses, "addresses", "", "Comma separated list of addresses that should be processed by the command")
 	flag.StringVar(&opts.Columns, "columns", "", "Comma separated list of columns that should be affected by the command")
+	flag.StringVar(&opts.Email, "email", "", "Email of the user")
+	flag.StringVar(&opts.Name, "name", "", "Name")
+	flag.BoolVar(&opts.Yes, "yes", false, "Answer yes to all questions")
 	dryRun := flag.String("dry-run", "true", "if 'false' it deletes all rows starting with the key, per default it only logs the rows that would be deleted, but does not really delete them")
 	versionFlag := flag.Bool("version", false, "Show version and exit")
 
@@ -104,59 +122,90 @@ func main() {
 	utils.Config = cfg
 
 	chainIdString := strconv.FormatUint(utils.Config.Chain.ClConfig.DepositChainID, 10)
-
-	bt, err := db.InitBigtable(utils.Config.Bigtable.Project, utils.Config.Bigtable.Instance, chainIdString, utils.Config.RedisCacheEndpoint)
-	if err != nil {
-		utils.LogFatal(err, "error initializing bigtable", 0)
-	}
-
 	chainIDBig := new(big.Int).SetUint64(utils.Config.Chain.ClConfig.DepositChainID)
-	rpcClient, err := rpc.NewLighthouseClient("http://"+cfg.Indexer.Node.Host+":"+cfg.Indexer.Node.Port, chainIDBig)
-	if err != nil {
-		utils.LogFatal(err, "lighthouse client error", 0)
-	}
 
-	erigonClient, err := rpc.NewErigonClient(utils.Config.Eth1ErigonEndpoint)
-	if err != nil {
-		logrus.Fatalf("error initializing erigon client: %v", err)
-	}
+	wg := &sync.WaitGroup{}
+	wg.Add(5)
 
-	db.MustInitDB(&types.DatabaseConfig{
-		Username:     cfg.WriterDatabase.Username,
-		Password:     cfg.WriterDatabase.Password,
-		Name:         cfg.WriterDatabase.Name,
-		Host:         cfg.WriterDatabase.Host,
-		Port:         cfg.WriterDatabase.Port,
-		MaxOpenConns: cfg.WriterDatabase.MaxOpenConns,
-		MaxIdleConns: cfg.WriterDatabase.MaxIdleConns,
-	}, &types.DatabaseConfig{
-		Username:     cfg.ReaderDatabase.Username,
-		Password:     cfg.ReaderDatabase.Password,
-		Name:         cfg.ReaderDatabase.Name,
-		Host:         cfg.ReaderDatabase.Host,
-		Port:         cfg.ReaderDatabase.Port,
-		MaxOpenConns: cfg.ReaderDatabase.MaxOpenConns,
-		MaxIdleConns: cfg.ReaderDatabase.MaxIdleConns,
-	})
+	go func() {
+		defer wg.Done()
+		var err error
+		bt, err = db.InitBigtable(utils.Config.Bigtable.Project, utils.Config.Bigtable.Instance, chainIdString, utils.Config.RedisCacheEndpoint)
+		if err != nil {
+			utils.LogFatal(err, "error initializing bigtable", 0)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		var err error
+		rpcClient, err = rpc.NewLighthouseClient("http://"+cfg.Indexer.Node.Host+":"+cfg.Indexer.Node.Port, chainIDBig)
+		if err != nil {
+			utils.LogFatal(err, "lighthouse client error", 0)
+		}
+		lighthouseClient = rpcClient
+	}()
+
+	go func() {
+		defer wg.Done()
+		var err error
+		erigonClient, err = rpc.NewErigonClient(utils.Config.Eth1ErigonEndpoint)
+		if err != nil {
+			logrus.Fatalf("error initializing erigon client: %v", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		db.MustInitDB(&types.DatabaseConfig{
+			Username:     cfg.WriterDatabase.Username,
+			Password:     cfg.WriterDatabase.Password,
+			Name:         cfg.WriterDatabase.Name,
+			Host:         cfg.WriterDatabase.Host,
+			Port:         cfg.WriterDatabase.Port,
+			MaxOpenConns: cfg.WriterDatabase.MaxOpenConns,
+			MaxIdleConns: cfg.WriterDatabase.MaxIdleConns,
+			SSL:          cfg.WriterDatabase.SSL,
+		}, &types.DatabaseConfig{
+			Username:     cfg.ReaderDatabase.Username,
+			Password:     cfg.ReaderDatabase.Password,
+			Name:         cfg.ReaderDatabase.Name,
+			Host:         cfg.ReaderDatabase.Host,
+			Port:         cfg.ReaderDatabase.Port,
+			MaxOpenConns: cfg.ReaderDatabase.MaxOpenConns,
+			MaxIdleConns: cfg.ReaderDatabase.MaxIdleConns,
+			SSL:          cfg.ReaderDatabase.SSL,
+		}, "pgx", "postgres")
+	}()
+
+	go func() {
+		defer wg.Done()
+		db.MustInitFrontendDB(&types.DatabaseConfig{
+			Username:     cfg.Frontend.WriterDatabase.Username,
+			Password:     cfg.Frontend.WriterDatabase.Password,
+			Name:         cfg.Frontend.WriterDatabase.Name,
+			Host:         cfg.Frontend.WriterDatabase.Host,
+			Port:         cfg.Frontend.WriterDatabase.Port,
+			MaxOpenConns: cfg.Frontend.WriterDatabase.MaxOpenConns,
+			MaxIdleConns: cfg.Frontend.WriterDatabase.MaxIdleConns,
+			SSL:          cfg.Frontend.WriterDatabase.SSL,
+		}, &types.DatabaseConfig{
+			Username:     cfg.Frontend.ReaderDatabase.Username,
+			Password:     cfg.Frontend.ReaderDatabase.Password,
+			Name:         cfg.Frontend.ReaderDatabase.Name,
+			Host:         cfg.Frontend.ReaderDatabase.Host,
+			Port:         cfg.Frontend.ReaderDatabase.Port,
+			MaxOpenConns: cfg.Frontend.ReaderDatabase.MaxOpenConns,
+			MaxIdleConns: cfg.Frontend.ReaderDatabase.MaxIdleConns,
+			SSL:          cfg.Frontend.ReaderDatabase.SSL,
+		}, "pgx", "postgres")
+	}()
+
+	wg.Wait()
+
 	defer db.ReaderDb.Close()
 	defer db.WriterDb.Close()
-	db.MustInitFrontendDB(&types.DatabaseConfig{
-		Username:     cfg.Frontend.WriterDatabase.Username,
-		Password:     cfg.Frontend.WriterDatabase.Password,
-		Name:         cfg.Frontend.WriterDatabase.Name,
-		Host:         cfg.Frontend.WriterDatabase.Host,
-		Port:         cfg.Frontend.WriterDatabase.Port,
-		MaxOpenConns: cfg.Frontend.WriterDatabase.MaxOpenConns,
-		MaxIdleConns: cfg.Frontend.WriterDatabase.MaxIdleConns,
-	}, &types.DatabaseConfig{
-		Username:     cfg.Frontend.ReaderDatabase.Username,
-		Password:     cfg.Frontend.ReaderDatabase.Password,
-		Name:         cfg.Frontend.ReaderDatabase.Name,
-		Host:         cfg.Frontend.ReaderDatabase.Host,
-		Port:         cfg.Frontend.ReaderDatabase.Port,
-		MaxOpenConns: cfg.Frontend.ReaderDatabase.MaxOpenConns,
-		MaxIdleConns: cfg.Frontend.ReaderDatabase.MaxIdleConns,
-	})
+
 	defer db.FrontendReaderDB.Close()
 	defer db.FrontendWriterDB.Close()
 
@@ -260,7 +309,7 @@ func main() {
 	case "debug-blocks":
 		err = debugBlocks()
 	case "clear-bigtable":
-		clearBigtable(opts.Table, opts.Family, opts.Key, opts.DryRun, bt)
+		clearBigtable(opts.Table, opts.Family, opts.Columns, opts.Key, opts.DryRun, bt)
 	case "index-old-eth1-blocks":
 		indexOldEth1Blocks(opts.StartBlock, opts.EndBlock, opts.BatchSize, opts.DataConcurrency, opts.Transformers, bt, erigonClient)
 	case "update-aggregation-bits":
@@ -273,6 +322,8 @@ func main() {
 		indexMissingBlocks(opts.StartBlock, opts.EndBlock, bt, erigonClient)
 	case "migrate-last-attestation-slot-bigtable":
 		migrateLastAttestationSlotToBigtable()
+	case "migrate-app-purchases":
+		err = migrateAppPurchases(opts.Key)
 	case "export-genesis-validators":
 		logrus.Infof("retrieving genesis validator state")
 		validators, err := rpcClient.GetValidatorState(0)
@@ -385,8 +436,14 @@ func main() {
 		err = fixEns(erigonClient)
 	case "fix-ens-addresses":
 		err = fixEnsAddresses(erigonClient)
+	case "disable-user-per-email":
+		err = disableUserPerEmail()
+	case "fix-epochs":
+		err = fixEpochs()
+	case "validate-firebase-tokens":
+		err = validateFirebaseTokens()
 	default:
-		utils.LogFatal(nil, fmt.Sprintf("unknown command %s", opts.Command), 0)
+		utils.LogFatal(nil, fmt.Sprintf("unknown command %s", opts.Command), 2)
 	}
 
 	if err != nil {
@@ -396,8 +453,99 @@ func main() {
 	}
 }
 
+func fixEpochs() error {
+	for e := opts.StartEpoch; e <= opts.EndEpoch; e++ {
+		err := fixEpoch(e)
+		if err != nil {
+			return fmt.Errorf("error fixingEpoch: %v: %w", e, err)
+		}
+		logrus.Infof("fixed epoch %v", e)
+	}
+	return nil
+}
+
+func fixEpoch(e uint64) error {
+	tx, err := db.WriterDb.Beginx()
+	if err != nil {
+		return fmt.Errorf("error starting tx: %w", err)
+	}
+	defer tx.Rollback()
+	s, err := lighthouseClient.GetValidatorParticipation(e)
+	if err != nil {
+		return err
+	}
+	err = db.UpdateEpochStatus(s, tx)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func disableUserPerEmail() error {
+	if opts.Email == "" {
+		return errors.New("no email specified")
+	}
+
+	if utils.Config.Frontend.SessionSecret == "" {
+		return fmt.Errorf("session secret is empty, please provide a secure random string")
+	}
+
+	logrus.Infof("initializing session store: %v", utils.Config.RedisSessionStoreEndpoint)
+
+	utils.InitSessionStore(utils.Config.Frontend.SessionSecret)
+
+	user := struct {
+		ID    uint64 `db:"id"`
+		Email string `db:"email"`
+	}{}
+	err := db.FrontendWriterDB.Get(&user, `select id, email from users where email = $1`, opts.Email)
+	if err != nil {
+		return err
+	}
+
+	if !askForConfirmation(fmt.Sprintf(`Do you want to disable the user with email: %v (id: %v)?
+
+- the user will get logged out
+- the password will change
+- the apikey will change
+- password-reset will be disabled
+`, user.Email, user.ID)) {
+		logrus.Warnf("aborted")
+		return nil
+	}
+
+	_, err = db.FrontendWriterDB.Exec(`update users set password = $3, api_key = $4, password_reset_not_allowed = true where id = $1 and email = $2`, user.ID, user.Email, utils.RandomString(128), utils.RandomString(32))
+	if err != nil {
+		return err
+	}
+	logrus.Infof("changed password and apikey and disallowed password-reset for user %v", user.ID)
+
+	ctx := context.Background()
+
+	// invalidate all sessions for this user
+	err = utils.SessionStore.SCS.Iterate(ctx, func(ctx context.Context) error {
+		sessionUserID, ok := utils.SessionStore.SCS.Get(ctx, "user_id").(uint64)
+		if !ok {
+			return nil
+		}
+
+		if user.ID == sessionUserID {
+			logrus.Infof("destroying a session of user %v", user.ID)
+			return utils.SessionStore.SCS.Destroy(ctx)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func fixEns(erigonClient *rpc.ErigonClient) error {
-	logrus.Infof("command: fix-ens")
+	logrus.WithField("dry", opts.DryRun).Infof("command: fix-ens")
 	addrs := []struct {
 		Address []byte `db:"address"`
 		EnsName string `db:"ens_name"`
@@ -459,7 +607,7 @@ func fixEns(erigonClient *rpc.ErigonClient) error {
 				reverseName, err := go_ens.ReverseResolve(erigonClient.GetNativeClient(), dbAddr)
 				if err != nil {
 					if err.Error() == "not a resolver" || err.Error() == "no resolution" {
-						logrus.WithFields(logrus.Fields{"addr": fmt.Sprintf("%#x", addr.Address), "name": addr.EnsName, "reason": fmt.Sprintf("failed reverse-resolve: %v", err.Error())}).Warnf("updating ens entry: is_primary_name = false")
+						logrus.WithFields(logrus.Fields{"addr": dbAddr, "name": addr.EnsName, "reason": fmt.Sprintf("failed reverse-resolve: %v", err.Error())}).Warnf("updating ens entry: is_primary_name = false")
 						if !opts.DryRun {
 							_, err = db.WriterDb.Exec(`update ens set is_primary_name = false where address = $1 and ens_name = $2`, addr.Address, addr.EnsName)
 							if err != nil {
@@ -632,6 +780,147 @@ func fixEnsAddresses(erigonClient *rpc.ErigonClient) error {
 			}
 		}
 	}
+	return nil
+}
+
+func migrateAppPurchases(appStoreSecret string) error {
+	// This code runs once so please don't judge code style too harshly
+
+	if appStoreSecret == "" {
+		return fmt.Errorf("appStoreSecret is empty")
+	}
+
+	client := storekit.NewVerificationClient().OnProductionEnv()
+
+	tx, err := db.WriterDb.Beginx()
+	if err != nil {
+		return fmt.Errorf("error starting db transactions: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Delete marked as duplicate, though the duplicate reject reason is not always set - mainly missing on historical data
+	_, err = tx.Exec("DELETE FROM users_app_subscriptions WHERE store = 'ios-appstore' AND reject_reason = 'duplicate';")
+	if err != nil {
+		return errors.Wrap(err, "error deleting duplicate receipt")
+	}
+
+	// Backup legacy receipts into custom column
+	_, err = tx.Exec("UPDATE users_app_subscriptions set legacy_receipt = receipt where legacy_receipt is null;")
+	if err != nil {
+		return errors.Wrap(err, "error backing up legacy receipts")
+	}
+
+	receipts := []*types.PremiumData{}
+	err = tx.Select(&receipts,
+		"SELECT id, receipt, store, active, validate_remotely, expires_at, product_id, user_id from users_app_subscriptions order by id desc",
+	)
+	if err != nil {
+		return errors.Wrap(err, "error getting app subscriptions")
+	}
+
+	for _, receipt := range receipts {
+		if receipt.Store != "ios-appstore" { // only interested in migrating iOS
+			continue
+		}
+		if len(receipt.Receipt) < 100 { // dont migrate data that has already been migrated (new receipt is a number of a hand full of digits while old one is insanely large)
+			continue
+		}
+
+		receiptData, err := base64.StdEncoding.DecodeString(receipt.Receipt)
+		if err != nil {
+			return errors.Wrap(err, "error decoding receipt")
+		}
+
+		// Call old deprecated endpoint to get the origin transaction id (new receipt info for new endpoints)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, resp, err := client.Verify(ctx, &storekit.ReceiptRequest{
+			ReceiptData:            receiptData,
+			Password:               appStoreSecret,
+			ExcludeOldTransactions: true,
+		})
+
+		if err != nil {
+			return errors.Wrap(err, "error verifying receipt")
+		}
+
+		if resp.LatestReceiptInfo == nil || len(resp.LatestReceiptInfo) == 0 {
+			logrus.Infof("no receipt info for purchase id %v", receipt.ID)
+			if receipt.Active && receipt.ValidateRemotely { // sanity, if there is an active subscription without receipt info we cam't delete it.
+				return fmt.Errorf("no receipt info for active purchase id %v", receipt.ID)
+			}
+			// since it is not active any more and we don't get any new receipt info from apple, just drop the receipt info
+			// hash can stay the same since a collision is unlikely (new and old receipt info)
+			_, err = tx.Exec("UPDATE users_app_subscriptions SET receipt = '' WHERE id = $1", receipt.ID)
+			if err != nil {
+				return errors.Wrap(err, "error deleting duplicate receipt")
+			}
+			continue
+		}
+
+		latestReceiptInfo := resp.LatestReceiptInfo[0]
+		logrus.Infof("Update purchase id %v with new receipt %v", receipt.ID, latestReceiptInfo.OriginalTransactionId)
+
+		_, err = tx.Exec("UPDATE users_app_subscriptions SET receipt = $1, receipt_hash = $2 WHERE id = $3", latestReceiptInfo.OriginalTransactionId, utils.HashAndEncode(latestReceiptInfo.OriginalTransactionId), receipt.ID)
+		if err != nil {
+			if strings.Contains(err.Error(), "duplicate key") { // handle historic duplicates
+				// get the duplicate receipt
+				duplicateReceipt := types.PremiumData{}
+				err = tx.Get(&duplicateReceipt, "SELECT id, user_id, active FROM users_app_subscriptions WHERE receipt_hash = $1", utils.HashAndEncode(latestReceiptInfo.OriginalTransactionId))
+				if err != nil {
+					return errors.Wrap(err, "error getting duplicate receipt")
+				}
+
+				// Keep the active receipt and delete the other one. In case both are inactive keep the newest
+				var deleteReceiptID uint64
+				if !duplicateReceipt.Active && receipt.Active {
+					deleteReceiptID = duplicateReceipt.ID
+				} else if duplicateReceipt.Active && !receipt.Active {
+					deleteReceiptID = receipt.ID
+				} else if !duplicateReceipt.Active && !receipt.Active {
+					if duplicateReceipt.ID > receipt.ID { // keep the newer one
+						deleteReceiptID = duplicateReceipt.ID
+					} else {
+						deleteReceiptID = receipt.ID
+					}
+				} else {
+					return fmt.Errorf("duplicate receipt has same active status: %v != %v for id: %v != %v", duplicateReceipt.Active, receipt.Active, duplicateReceipt.ID, receipt.ID)
+				}
+
+				// new ios handler will automatically update the product id if the user switched the package, so we will just drop this receipt
+				_, err = tx.Exec("DELETE FROM users_app_subscriptions WHERE id = $1", deleteReceiptID)
+				if err != nil {
+					return errors.Wrap(err, "error deleting duplicate receipt")
+				}
+				logrus.Infof("deleted duplicate receipt id %v", receipt.ID)
+
+				// the one we keep and update is opposite of the one we deleted
+				var updateReceiptID uint64
+				if deleteReceiptID == duplicateReceipt.ID {
+					updateReceiptID = receipt.ID
+				} else {
+					updateReceiptID = duplicateReceipt.ID
+				}
+
+				_, err = tx.Exec("UPDATE users_app_subscriptions SET receipt = $1, receipt_hash = $2 WHERE id = $3", latestReceiptInfo.OriginalTransactionId, utils.HashAndEncode(latestReceiptInfo.OriginalTransactionId), updateReceiptID)
+				if err != nil {
+					return errors.Wrap(err, "error updating receipt")
+				}
+			} else {
+				return errors.Wrap(err, "error updating purchase id")
+			}
+		}
+
+		logrus.Infof("Migrated purchase id %v\n", receipt.ID)
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return errors.Wrap(err, "error committing tx")
+	}
+
+	logrus.Infof("done migrating data")
 	return nil
 }
 
@@ -1171,10 +1460,10 @@ func compareRewards(dayStart uint64, dayEnd uint64, validator uint64, bt *db.Big
 
 }
 
-func clearBigtable(table string, family string, key string, dryRun bool, bt *db.Bigtable) {
+func clearBigtable(table string, family string, columns string, key string, dryRun bool, bt *db.Bigtable) {
 
 	if !dryRun {
-		confirmation := utils.CmdPrompt(fmt.Sprintf("Are you sure you want to delete all big table entries starting with [%v] for family [%v]?", key, family))
+		confirmation := utils.CmdPrompt(fmt.Sprintf("Are you sure you want to delete all big table entries starting with [%v] for family [%v] and columns [%v]?", key, family, columns))
 		if confirmation != "yes" {
 			logrus.Infof("Abort!")
 			return
@@ -1194,7 +1483,7 @@ func clearBigtable(table string, family string, key string, dryRun bool, bt *db.
 	// if err != nil {
 	// 	logrus.Fatal(err)
 	// }
-	err := bt.ClearByPrefix(table, family, key, dryRun)
+	err := bt.ClearByPrefix(table, family, columns, key, dryRun)
 
 	if err != nil {
 		logrus.Fatalf("error deleting from bigtable: %v", err)
@@ -1298,7 +1587,7 @@ func indexOldEth1Blocks(startBlock uint64, endBlock uint64, batchSize uint64, co
 	logrus.Infof("transformerFlag: %v", transformerFlag)
 	transformerList := strings.Split(transformerFlag, ",")
 	if transformerFlag == "all" {
-		transformerList = []string{"TransformBlock", "TransformTx", "TransformBlobTx", "TransformItx", "TransformERC20", "TransformERC721", "TransformERC1155", "TransformWithdrawals", "TransformUncle", "TransformEnsNameRegistered"}
+		transformerList = []string{"TransformBlock", "TransformTx", "TransformBlobTx", "TransformItx", "TransformERC20", "TransformERC721", "TransformERC1155", "TransformWithdrawals", "TransformUncle", "TransformEnsNameRegistered", "TransformContract"}
 	} else if len(transformerList) == 0 {
 		utils.LogError(nil, "no transformer functions provided", 0)
 		return
@@ -1331,6 +1620,8 @@ func indexOldEth1Blocks(startBlock uint64, endBlock uint64, batchSize uint64, co
 		case "TransformEnsNameRegistered":
 			transforms = append(transforms, bt.TransformEnsNameRegistered)
 			importENSChanges = true
+		case "TransformContract":
+			transforms = append(transforms, bt.TransformContract)
 		default:
 			utils.LogError(nil, "Invalid transformer flag %v", 0)
 			return
@@ -1716,7 +2007,7 @@ func UpdateValidatorStatisticsSyncData(day uint64, client rpc.Client, dryRun boo
 				UPDATE validator_stats set
 				participated_sync = $1,
 				missed_sync = $2,
-				orphaned_sync = $3,
+				orphaned_sync = $3
 				WHERE day = $4 AND validatorindex = $5`,
 				data.ParticipatedSync,
 				data.MissedSync,
@@ -1783,4 +2074,74 @@ func reExportSyncCommittee(rpcClient rpc.Client, p uint64, dryRun bool) error {
 
 		return tx.Commit()
 	}
+}
+
+func askForConfirmation(q string) bool {
+	if opts.Yes {
+		return true
+	}
+	var s string
+
+	fmt.Printf("%s (y/N): ", q)
+	_, err := fmt.Scanln(&s)
+	if err != nil {
+		if err.Error() == "unexpected newline" {
+			return false
+		}
+		panic(err)
+	}
+
+	// s = strings.TrimSpace(s)
+	s = strings.ToLower(s)
+
+	if s == "y" || s == "yes" {
+		return true
+	}
+	return false
+}
+
+func validateFirebaseTokens() error {
+	// retrieve all userIds and tokens from the database
+
+	var users []struct {
+		ID    uint64 `db:"user_id"`
+		Token string `db:"notification_token"`
+	}
+
+	err := db.FrontendWriterDB.Select(&users, `select DISTINCT ON (user_id, notification_token) user_id, notification_token from users_devices where length(notification_token) > 20 and user_id = xxx;`)
+
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	// badge := 1
+	for _, user := range users {
+		// validate the token by trying to send a message to the user
+
+		notification := new(messaging.Notification)
+		notification.Title = "test"
+		notification.Body = "this is a test message"
+
+		message := new(messaging.Message)
+		message.Notification = notification
+		message.Token = user.Token
+
+		message.APNS = new(messaging.APNSConfig)
+		message.APNS.Payload = new(messaging.APNSPayload)
+		message.APNS.Payload.Aps = new(messaging.Aps)
+		message.APNS.Payload.Aps.Sound = "default"
+		// message.APNS.Payload.Aps.Badge = &badge
+		// message.APNS.Payload.Aps.AlertString = "test"
+
+		meassages := []*messaging.Message{
+			message,
+		}
+
+		err := notify.SendPushBatch(meassages, false)
+		if err != nil {
+			logrus.Fatal(err)
+		}
+	}
+
+	return nil
 }
