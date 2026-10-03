@@ -111,6 +111,9 @@ indexer:
     port: '$CL_PORT'
     type: lighthouse
   eth1DepositContractFirstBlock: 0
+
+nodeJobsProcessor:
+  clEndpoint: 'http://127.0.0.1:$CL_PORT'
 EOL
 
 echo "generated config written to config.yml"

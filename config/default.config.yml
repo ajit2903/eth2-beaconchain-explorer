@@ -60,5 +60,10 @@ indexer:
     port: "4000" # port of the backend node
     type: "prysm" # can be either prysm or lighthouse
     pageSize: 500 # the amount of entries to fetch per paged rpc call
+
   eth1Endpoint: 'https://goerli.infura.io/v3/<api-token>'
   eth1DepositContractFirstBlock: 2523557
+
+# Used by the separate node-jobs-processor binary to broadcast signed messages.
+nodeJobsProcessor:
+  clEndpoint: "http://localhost:4000"

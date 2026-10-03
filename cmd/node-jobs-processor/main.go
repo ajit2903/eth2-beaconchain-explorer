@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gobitfly/eth2-beaconchain-explorer/db"
@@ -34,6 +35,10 @@ func main() {
 	}
 	utils.Config = cfg
 	logrus.WithField("config", *configPath).WithField("version", version.Version).WithField("chainName", utils.Config.Chain.ClConfig.ConfigName).Printf("starting")
+
+	if strings.TrimSpace(utils.Config.NodeJobsProcessor.ClEndpoint) == "" {
+		logrus.Fatal("node-jobs processor consensus endpoint is not configured")
+	}
 
 	if utils.Config.Metrics.Enabled {
 		go func(addr string) {

@@ -304,20 +304,17 @@ func SubmitBLSToExecutionChangesNodeJobs() error {
 }
 
 func SubmitBLSToExecutionChangesNodeJob(job *types.NodeJob) error {
-	client := &http.Client{Timeout: time.Second * 10}
-	url := fmt.Sprintf("%s/eth/v1/beacon/pool/bls_to_execution_changes", utils.Config.NodeJobsProcessor.ClEndpoint)
-	resp, err := client.Post(url, "application/json", bytes.NewReader(job.RawData))
+	statusCode, status, responseBody, err := postNodeJobToBeaconNode(
+		"/eth/v1/beacon/pool/bls_to_execution_changes",
+		job.RawData,
+	)
 	if err != nil {
 		return err
 	}
 	jobStatus := types.SubmittedToNodeNodeJobStatus
-	if resp.StatusCode != 200 {
-		d, _ := io.ReadAll(resp.Body)
-		if len(d) > 1000 {
-			d = d[:1000]
-		}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
 		jobStatus = types.FailedNodeJobStatus
-		logrus.WithFields(logrus.Fields{"data": string(d), "status": resp.Status, "jobID": job.ID}).Warnf("failed submitting a job")
+		logrus.WithFields(logrus.Fields{"data": string(responseBody), "status": status, "jobID": job.ID}).Warnf("failed submitting a job")
 	}
 	job.Status = jobStatus
 	job.SubmittedToNodeTime.Time = time.Now()
@@ -328,6 +325,36 @@ func SubmitBLSToExecutionChangesNodeJob(job *types.NodeJob) error {
 	}
 	logrus.WithFields(logrus.Fields{"id": job.ID, "type": job.Type, "status": jobStatus}).Infof("submitted node_job")
 	return nil
+}
+
+func postNodeJobToBeaconNode(path string, data []byte) (int, string, []byte, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(utils.Config.NodeJobsProcessor.ClEndpoint), "/")
+	if endpoint == "" {
+		return 0, "", nil, fmt.Errorf("node-jobs processor consensus endpoint is not configured")
+	}
+
+	req, err := http.NewRequest(http.MethodPost, endpoint+path, bytes.NewReader(data))
+	if err != nil {
+		return 0, "", nil, fmt.Errorf("creating beacon-node request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: time.Second * 10}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", nil, fmt.Errorf("posting to beacon node: %w", err)
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 1001))
+	if err != nil {
+		return resp.StatusCode, resp.Status, nil, fmt.Errorf("reading beacon-node response: %w", err)
+	}
+	if len(responseBody) > 1000 {
+		responseBody = responseBody[:1000]
+	}
+
+	return resp.StatusCode, resp.Status, responseBody, nil
 }
 
 func CreateVoluntaryExitNodeJob(nj *types.NodeJob) (*types.NodeJob, error) {
@@ -439,20 +466,17 @@ func SubmitVoluntaryExitNodeJobs() error {
 }
 
 func SubmitVoluntaryExitNodeJob(job *types.NodeJob) error {
-	client := &http.Client{Timeout: time.Second * 10}
-	url := fmt.Sprintf("%s/eth/v1/beacon/pool/voluntary_exits", utils.Config.NodeJobsProcessor.ClEndpoint)
-	resp, err := client.Post(url, "application/json", bytes.NewReader(job.RawData))
+	statusCode, status, responseBody, err := postNodeJobToBeaconNode(
+		"/eth/v1/beacon/pool/voluntary_exits",
+		job.RawData,
+	)
 	if err != nil {
 		return err
 	}
 	jobStatus := types.SubmittedToNodeNodeJobStatus
-	if resp.StatusCode != 200 {
-		d, _ := io.ReadAll(resp.Body)
-		if len(d) > 1000 {
-			d = d[:1000]
-		}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
 		jobStatus = types.FailedNodeJobStatus
-		logrus.WithFields(logrus.Fields{"res": string(d), "status": resp.Status, "jobID": job.ID, "jobType": job.Type}).Warnf("failed submitting a job")
+		logrus.WithFields(logrus.Fields{"res": string(responseBody), "status": status, "jobID": job.ID, "jobType": job.Type}).Warnf("failed submitting a job")
 	}
 	job.Status = jobStatus
 	job.SubmittedToNodeTime.Time = time.Now()
