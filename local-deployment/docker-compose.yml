@@ -35,6 +35,9 @@ services:
     command: go run ./cmd/explorer -config /app/local-deployment/config.yml
     environment:
       - FRONTEND_ENABLED=true
+  node-jobs-processor:
+    <<: *default-service
+    command: go run ./cmd/node-jobs-processor -config /app/local-deployment/config.yml
   ratelimits-updater:
     <<: *default-service
     command: go run ./cmd/misc -config /app/local-deployment/config.yml -command=update-ratelimits

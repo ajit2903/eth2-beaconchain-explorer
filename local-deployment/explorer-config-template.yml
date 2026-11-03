@@ -61,3 +61,6 @@ indexer:
     port: '{{.CLNodePort}}'
     type: lighthouse
   eth1DepositContractFirstBlock: 0
+
+nodeJobsProcessor:
+  clEndpoint: 'http://{{.CLNodeHost}}:{{.CLNodePort}}'

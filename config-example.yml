@@ -56,3 +56,8 @@ indexer:
     pageSize: 500 # the amount of entries to fetch per paged rpc call
   eth1Endpoint: "https://goerli.infura.io/v3/<api-token>"
   eth1DepositContractFirstBlock: 2523557
+
+# The node-jobs processor is a separate process from the web frontend.
+# It submits signed validator messages to the consensus-layer REST API.
+nodeJobsProcessor:
+  clEndpoint: "http://localhost:4000"
